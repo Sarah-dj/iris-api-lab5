@@ -1,0 +1,151 @@
+# Parties 1 a 3 executees sur un runner GitHub (poste "local" amd64 avec Docker)
+# Declenchement manuel uniquement.
+name: parties-1-3-poste
+on:
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  docker-acr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "P0 - installer minikube puis verifier les outils"
+        run: |
+          curl -sLo minikube https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+          sudo install minikube /usr/local/bin/minikube && rm minikube
+          bash scripts/verifier-outils.sh || true
+      - name: "P1 - build multi-etapes v1"
+        run: docker build -t iris-api:v1 . 2>&1 | tail -25
+      - name: "P1 - build naif"
+        run: docker build -f Dockerfile.naive -t iris-api:naive . 2>&1 | tail -5
+      - name: "P1 - docker images, history, whoami"
+        run: |
+          echo "### docker images iris-api"; docker images iris-api
+          echo "### docker image history iris-api:v1"; docker image history iris-api:v1 --format "table {{.CreatedBy}}\t{{.Size}}" | cut -c1-110
+          echo "### whoami naive"; docker run --rm iris-api:naive whoami
+          echo "### whoami v1"; docker run --rm iris-api:v1 whoami
+      - name: "P1 - run, health, predictions"
+        run: |
+          docker run -d -p 8000:8000 --name iris iris-api:v1
+          for i in $(seq 1 30); do docker ps --format '{{.Status}}' | grep -q healthy && break; sleep 3; done
+          echo "### docker ps"; docker ps
+          echo "### GET /"; curl -s http://localhost:8000/; echo
+          echo "### setosa"; curl -s -X POST http://localhost:8000/predict -H "Content-Type: application/json" -d '{"features": [5.1, 3.5, 1.4, 0.2]}'; echo
+          echo "### virginica"; curl -s -X POST http://localhost:8000/predict -H "Content-Type: application/json" -d '{"features": [6.3, 3.3, 6.0, 2.5]}'; echo
+          echo "### invalide"; curl -s -o /tmp/r.json -w "HTTP %{http_code}\n" -X POST http://localhost:8000/predict -H "Content-Type: application/json" -d '{"features": [1, 2]}'; cut -c1-200 /tmp/r.json; echo
+          echo "### health history"; docker inspect --format '{{.State.Health.Status}} {{len .State.Health.Log}} checks' iris
+          echo "### docker logs"; docker logs iris 2>&1 | tail -6
+      - name: "P1 - tests pytest"
+        run: |
+          python3 -m pip install -q -r requirements.txt -r requirements-dev.txt
+          python3 train.py model/model.joblib && python3 -m pytest -q
+      - name: "P1 - Trivy (version fixee)"
+        run: |
+          for img in iris-api:v1 iris-api:naive; do
+            echo "### trivy $img"
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.76.1 image --quiet --severity HIGH,CRITICAL --format table $img 2>&1 | grep -E "Total:|^[a-z].*\(" | head -12
+          done
+      - name: "P1 - cache (Q2) : modification de app/main.py"
+        run: |
+          sed -i 's/"service": "iris-api"/"service": "iris-api (cache test)"/' app/main.py
+          docker build --progress=plain -t iris-api:cachetest . 2>&1 | grep -E "^#[0-9]+ \[|CACHED" | head -30
+          git checkout app/main.py
+      - name: "P1 - plate-forme amd64 (Q ARM)"
+        run: |
+          docker buildx build --platform linux/amd64 -t iris-api:v1-amd64 --load . > /dev/null 2>&1
+          docker image inspect iris-api:v1-amd64 --format '{{.Os}}/{{.Architecture}}'
+      - name: "P1 - compose API + Redis"
+        run: |
+          docker rm -f iris
+          docker compose up -d --build 2>&1 | tail -3
+          sleep 20; docker compose ps
+          curl -s -X POST http://localhost:8000/predict -H "Content-Type: application/json" -d '{"features": [5.1, 3.5, 1.4, 0.2]}' > /dev/null
+          curl -s -X POST http://localhost:8000/predict -H "Content-Type: application/json" -d '{"features": [5.1, 3.5, 1.4, 0.2]}' > /dev/null
+          echo "### stats"; curl -s http://localhost:8000/stats; echo
+          docker compose down 2>&1 | tail -1
+      - name: "P2 - Azure login (OIDC)"
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: "P2 - push v1 et v2 dans ACR"
+        run: |
+          LS=${{ vars.ACR_NAME }}.azurecr.io
+          az acr login --name ${{ vars.ACR_NAME }}
+          docker tag iris-api:v1 $LS/iris-api:v1
+          docker push $LS/iris-api:v1 2>&1 | tail -3
+          docker build --build-arg APP_VERSION=2.0.0 -t $LS/iris-api:v2 . > /dev/null 2>&1
+          docker push $LS/iris-api:v2 2>&1 | tail -2
+          echo "### show-tags"; az acr repository show-tags --name ${{ vars.ACR_NAME }} --repository iris-api -o table
+          docker buildx imagetools inspect $LS/iris-api:v1 | grep -i platform
+
+  minikube:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "P3 - demarrer minikube"
+        run: |
+          curl -sLo minikube https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+          sudo install minikube /usr/local/bin/minikube
+          minikube start --driver=docker --cpus=2 --memory=3g 2>&1 | tail -3
+          kubectl config current-context; kubectl get nodes
+          minikube addons enable metrics-server 2>&1 | tail -1
+      - name: "P3 - image dans minikube"
+        run: |
+          docker build -t iris-api:v1 . > /dev/null 2>&1
+          minikube image load iris-api:v1
+          minikube image ls | grep iris-api
+      - name: "P3 - appliquer les manifestes"
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/configmap.yaml
+          kubectl create secret generic iris-secret --namespace iris --from-literal=API_KEY=$(openssl rand -hex 16)
+          kubectl apply -f k8s/deployment.yaml -f k8s/service.yaml
+          kubectl config set-context --current --namespace=iris
+          kubectl rollout status deployment/iris-api --timeout=180s
+          echo "### kubectl get pods"; kubectl get pods
+          echo "### kubectl get all"; kubectl get all
+          echo "### id"; kubectl exec deploy/iris-api -- id
+          echo "### describe pod (events)"; kubectl describe pod -l app=iris-api | grep -A8 "^Events" | head -9
+      - name: "P3 - acces a l'API"
+        run: |
+          URL=$(minikube service iris-api --namespace iris --url | head -1); echo "URL=$URL" >> $GITHUB_ENV
+          curl -s $URL/; echo
+          curl -s -X POST $URL/predict -H "Content-Type: application/json" -d '{"features": [6.3, 3.3, 6.0, 2.5]}'; echo
+      - name: "P3 - experience 1a : suppression d'un pod"
+        run: |
+          POD=$(kubectl get pods -l app=iris-api -o jsonpath='{.items[0].metadata.name}')
+          echo "pod supprime : $POD"; kubectl delete pod $POD --wait=false
+          for i in 1 2 3 4 5 6; do date +%T; kubectl get pods --no-headers; sleep 3; done
+          kubectl rollout status deployment/iris-api --timeout=120s
+      - name: "P3 - experience 1b : processus tue"
+        run: |
+          POD=$(kubectl get pods -l app=iris-api -o jsonpath='{.items[0].metadata.name}')
+          kubectl exec $POD -- python -c "import os, signal; os.kill(1, signal.SIGTERM)" || true
+          for i in 1 2 3 4 5 6; do date +%T; kubectl get pods --no-headers; sleep 3; done
+      - name: "P3 - experience 2 : compteurs par pod"
+        run: |
+          kubectl rollout status deployment/iris-api --timeout=120s; sleep 5
+          for i in $(seq 1 12); do
+            curl -s -X POST $URL/predict -H "Content-Type: application/json" -d '{"features": [5.1, 3.5, 1.4, 0.2]}' | grep -o '"pod":"[^"]*"'
+          done | sort | uniq -c
+          for i in 1 2 3 4 5 6; do curl -s $URL/stats; echo; done
+      - name: "P3 - experience 3 : ConfigMap et Secret"
+        run: |
+          KEY=$(kubectl get secret iris-secret -o jsonpath='{.data.API_KEY}' | base64 --decode)
+          echo "### avant"; curl -s -H "X-API-Key: $KEY" $URL/admin/config; echo
+          sed -i 's/LOG_LEVEL: "INFO"/LOG_LEVEL: "DEBUG"/' k8s/configmap.yaml
+          kubectl apply -f k8s/configmap.yaml
+          echo "### apres apply"; curl -s -H "X-API-Key: $KEY" $URL/admin/config; echo
+          kubectl rollout restart deployment/iris-api && kubectl rollout status deployment/iris-api --timeout=180s
+          echo "### apres rollout restart"; curl -s -H "X-API-Key: $KEY" $URL/admin/config; echo
+          echo "### mauvaise cle"; curl -s -H "X-API-Key: faux" $URL/admin/config; echo
+      - name: "P3 - HPA"
+        run: |
+          kubectl apply -f k8s/hpa.yaml
+          for i in $(seq 1 20); do kubectl get hpa --no-headers | grep -q "cpu: [0-9]" && break; sleep 10; done
+          kubectl get hpa
+          kubectl top pods || true
